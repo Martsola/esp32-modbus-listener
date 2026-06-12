@@ -83,6 +83,7 @@ HardwareSerial modbusSerial(UART_RS485);
 
 // State
 bool mqttConnected = false;
+bool apModeActive = false;
 unsigned long lastMqttReconnect = 0;
 unsigned long lastWifiCheck = 0;
 unsigned long bootTime = 0;
@@ -219,6 +220,7 @@ unsigned long lastRequestTime = 0;
 
 // MQTT Home Assistant discovery
 bool haDiscoverySent = false;
+bool legacyCleanupDone = false;
 unsigned long lastMeterPublish = 0;
 #define METER_PUBLISH_INTERVAL 5000  // Publish meter values every 5 seconds
 
@@ -245,6 +247,7 @@ void mqttReconnect();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void publishStatus();
 void publishHADiscovery();
+void cleanupLegacyProxyDiscovery();
 void publishMeterValues();
 
 // Web Server
@@ -476,6 +479,7 @@ void setupWiFi() {
   Serial.println(config.wifi_ssid);
   
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
   WiFi.begin(config.wifi_ssid, config.wifi_password);
   
   // Wait for connection with timeout
@@ -487,6 +491,7 @@ void setupWiFi() {
   }
   
   if (WiFi.status() == WL_CONNECTED) {
+    apModeActive = false;
     Serial.println("\nWiFi connected!");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
@@ -504,6 +509,7 @@ void setupAccessPoint() {
   
   WiFi.mode(WIFI_AP);
   WiFi.softAP(apName, "modbuslistener");
+  apModeActive = true;
   
   Serial.print("AP SSID: ");
   Serial.println(apName);
@@ -515,6 +521,10 @@ void setupAccessPoint() {
 void checkWiFiConnection() {
   if (strlen(config.wifi_ssid) == 0) {
     return;  // Running in AP mode
+  }
+
+  if (apModeActive) {
+    return;  // Keep AP fallback stable; reconnect after reboot or new settings
   }
   
   if (WiFi.status() != WL_CONNECTED) {
@@ -575,6 +585,12 @@ void mqttReconnect() {
     char cmdTopic[64];
     snprintf(cmdTopic, sizeof(cmdTopic), "modbus_listener/%s/cmd/#", deviceId);
     mqtt.subscribe(cmdTopic);
+
+    // Remove retained discovery payloads from legacy proxy firmware.
+    if (!legacyCleanupDone) {
+      cleanupLegacyProxyDiscovery();
+      legacyCleanupDone = true;
+    }
     
     // Send Home Assistant discovery messages
     publishHADiscovery();
@@ -615,6 +631,32 @@ void publishStatus() {
     snprintf(payload, sizeof(payload), "%s", WiFi.softAPIP().toString().c_str());
   }
   mqtt.publish(topic, payload, true);
+}
+
+void cleanupLegacyProxyDiscovery() {
+  if (!mqtt.connected()) return;
+
+  Serial.println("Cleaning up legacy modbus_proxy discovery topics...");
+
+  const char* sensorIds[] = {
+    "voltage_a", "voltage_b", "voltage_c",
+    "current_a", "current_b", "current_c",
+    "power_a", "power_b", "power_c", "power_total",
+    "reactive_a", "reactive_b", "reactive_c", "reactive_total",
+    "apparent_a", "apparent_b", "apparent_c", "apparent_total",
+    "pf_a", "pf_b", "pf_c", "pf_total",
+    "frequency", "pt", "ct"
+  };
+
+  char topic[160];
+  for (size_t i = 0; i < (sizeof(sensorIds) / sizeof(sensorIds[0])); i++) {
+    snprintf(topic, sizeof(topic), "homeassistant/sensor/modbus_proxy_%s/%s/config", deviceId, sensorIds[i]);
+    // Empty retained payload deletes retained discovery topic on broker.
+    mqtt.publish(topic, "", true);
+    delay(10);
+  }
+
+  Serial.println("Legacy proxy discovery cleanup published.");
 }
 
 // Helper to publish a single HA sensor discovery message
@@ -675,8 +717,14 @@ void publishHASensor(const char* sensorId, const char* name, const char* unit,
   doc["payload_available"] = "online";
   doc["payload_not_available"] = "offline";
   
-  serializeJson(doc, payload, sizeof(payload));
-  mqtt.publish(topic, payload, true);
+  size_t payloadLen = measureJson(doc);
+  if (payloadLen >= sizeof(payload)) {
+    Serial.printf("[MQTT] Discovery payload too large for %s (%u bytes), skipping.\n", sensorId, (unsigned)payloadLen);
+    return;
+  }
+
+  payloadLen = serializeJson(doc, payload, sizeof(payload));
+  mqtt.publish(topic, (uint8_t*)payload, payloadLen, true);
   
   delay(50);  // Small delay to avoid overwhelming MQTT
 }
@@ -777,8 +825,14 @@ void publishMeterValues() {
   }
   
   char payload[768];
-  serializeJson(doc, payload, sizeof(payload));
-  mqtt.publish(topic, payload, false);
+  size_t payloadLen = measureJson(doc);
+  if (payloadLen >= sizeof(payload)) {
+    Serial.printf("[MQTT] Meter payload too large (%u bytes), skipping publish.\n", (unsigned)payloadLen);
+    return;
+  }
+
+  payloadLen = serializeJson(doc, payload, sizeof(payload));
+  mqtt.publish(topic, (uint8_t*)payload, payloadLen, false);
   
   if (debugMode) {
     Serial.printf("[MQTT] Published meter values: Pt=%dW f=%.2fHz\n", 
@@ -938,10 +992,13 @@ void handleConfig() {
 void handleSave() {
   // Get WiFi settings
   if (webServer.hasArg("wifi_ssid")) {
-    strncpy(config.wifi_ssid, webServer.arg("wifi_ssid").c_str(), sizeof(config.wifi_ssid) - 1);
+    String ssid = webServer.arg("wifi_ssid");
+    ssid.trim();
+    snprintf(config.wifi_ssid, sizeof(config.wifi_ssid), "%s", ssid.c_str());
   }
   if (webServer.hasArg("wifi_pass")) {
-    strncpy(config.wifi_password, webServer.arg("wifi_pass").c_str(), sizeof(config.wifi_password) - 1);
+    String wifiPass = webServer.arg("wifi_pass");
+    snprintf(config.wifi_password, sizeof(config.wifi_password), "%s", wifiPass.c_str());
   }
   
   // Get MQTT settings
