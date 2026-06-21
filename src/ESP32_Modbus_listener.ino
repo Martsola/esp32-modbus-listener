@@ -818,10 +818,14 @@ void publishMeterValues() {
   
   doc["frequency"] = round(meter.frequency * 100) / 100.0;
 
-  // Scaling parameters (PT/CT). These are updated only when the master reads them.
+  // Scaling parameters (PT/CT). Always include keys so HA templates stay valid;
+  // use null when the master has not yet read them.
   if (scaling.valid) {
     doc["pt"] = scaling.pt;
     doc["ct"] = scaling.ct;
+  } else {
+    doc["pt"] = nullptr;
+    doc["ct"] = nullptr;
   }
   
   char payload[768];
